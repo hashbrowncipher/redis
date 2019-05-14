@@ -560,7 +560,7 @@ void loadServerConfigFromString(char *config) {
             zfree(server.pidfile);
             server.pidfile = zstrdup(argv[1]);
         } else if (!strcasecmp(argv[0],"dbfilename") && argc == 2) {
-            if (!pathIsBaseName(argv[1])) {
+            if (argv[1][0] != '|' && !pathIsBaseName(argv[1])) {
                 err = "dbfilename can't be a path, just a filename";
                 goto loaderr;
             }

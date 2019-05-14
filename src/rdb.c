@@ -1215,8 +1215,91 @@ werr: /* Write error. */
     return C_ERR;
 }
 
-/* Save the DB on disk. Return C_ERR on error, C_OK on success. */
-int rdbSave(char *filename, rdbSaveInfo *rsi) {
+static int waitpidUntilFinished(int pid, int *statloc) {
+    int rc;
+    while(1) {
+        rc = waitpid(pid, statloc, 0);
+        if(rc == -1)
+            /* I don't know how this would happen for a child we launched,
+             * but whatever. */
+            break;
+
+        if (WIFEXITED(*statloc))
+            break;
+
+        if (WIFSIGNALED(*statloc))
+            break;
+    }
+
+    return rc;
+}
+
+static int rdbSaveToPipe(char *exec_name, rdbSaveInfo *rsi) {
+    int fds[2];
+    int statloc;
+    int write_error = 0;
+    int status;
+    int child_pid;
+    FILE *fp;
+    rio rdb;
+
+    if(pipe(fds)) {
+        serverLog(LL_WARNING,
+            "Failed to create pipe for rdb writer process: %s",
+            strerror(errno));
+    }
+    child_pid = fork();
+    if (child_pid == 0) {
+        //in child
+        close(fds[1]);
+        dup2(fds[0], 0);
+        close(fds[0]);
+
+        execl(exec_name, exec_name, "save");
+
+        serverLog(LL_WARNING,
+            "Failed to exec child rdb writer process (%s): %s",
+            exec_name,
+            strerror(errno));
+        exitFromChild(1);
+    } else if (child_pid == -1) {
+        serverLog(LL_WARNING, "Failed to fork rdb writer process: %s",
+            strerror(errno));
+        return C_ERR;
+    }
+
+    fp = fdopen(fds[1], "w");
+    rioInitWithFile(&rdb,fp);
+
+    status = rdbSaveRio(&rdb,&write_error,RDB_SAVE_NONE,rsi);
+    if (status == C_ERR) {
+        /* EPIPE would be the most common here */
+        serverLog(LL_WARNING, "Write error saving DB to pipe: %s",
+                strerror(write_error));
+    }
+
+    fclose(fp);
+
+    if(status != C_OK)
+        return C_ERR;
+
+    waitpidUntilFinished(child_pid, &statloc);
+    if(WIFEXITED(statloc) && WEXITSTATUS(statloc) == 0)
+       return C_OK;
+
+    if(WIFEXITED(statloc) && WEXITSTATUS(statloc) != 0) {
+        serverLog(LL_WARNING, "rdb writer process exited with status %d",
+            WEXITSTATUS(statloc));
+    }
+    else if(WIFSIGNALED(statloc)) {
+        serverLog(LL_WARNING, "rdb writer process terminated by signal %d",
+            WTERMSIG(statloc));
+    }
+
+    return C_ERR;
+}
+
+static int rdbSaveToFile(char *filename, rdbSaveInfo *rsi) {
     char tmpfile[256];
     char cwd[MAXPATHLEN]; /* Current working dir path for error messages. */
     FILE *fp;
@@ -1267,9 +1350,6 @@ int rdbSave(char *filename, rdbSaveInfo *rsi) {
     }
 
     serverLog(LL_NOTICE,"DB saved on disk");
-    server.dirty = 0;
-    server.lastsave = time(NULL);
-    server.lastbgsave_status = C_OK;
     return C_OK;
 
 werr:
@@ -1277,6 +1357,24 @@ werr:
     fclose(fp);
     unlink(tmpfile);
     return C_ERR;
+}
+
+/* Save the DB on disk. Return C_ERR on error, C_OK on success. */
+int rdbSave(char *filename, rdbSaveInfo *rsi) {
+    int status;
+
+    if (filename[0] == '|')
+        status = rdbSaveToPipe(&filename[1], rsi);
+    else
+        status = rdbSaveToFile(filename, rsi);
+
+    if (status == C_OK) {
+        server.dirty = 0;
+        server.lastsave = time(NULL);
+        server.lastbgsave_status = C_OK;
+    }
+
+    return status;
 }
 
 int rdbSaveBackground(char *filename, rdbSaveInfo *rsi) {
