@@ -1252,7 +1252,7 @@ static int rdbSaveToPipe(char *exec_name, rdbSaveInfo *rsi) {
     if (child_pid == 0) {
         //in child
         close(fds[1]);
-        dup2(fds[0], 0);
+        dup2(fds[0], STDIN_FILENO);
         close(fds[0]);
 
         execl(exec_name, exec_name, "save");
@@ -1268,6 +1268,7 @@ static int rdbSaveToPipe(char *exec_name, rdbSaveInfo *rsi) {
         return C_ERR;
     }
 
+    close(fds[0]);
     fp = fdopen(fds[1], "w");
     rioInitWithFile(&rdb,fp);
 
@@ -1280,12 +1281,9 @@ static int rdbSaveToPipe(char *exec_name, rdbSaveInfo *rsi) {
 
     fclose(fp);
 
-    if(status != C_OK)
-        return C_ERR;
-
     waitpidUntilFinished(child_pid, &statloc);
     if(WIFEXITED(statloc) && WEXITSTATUS(statloc) == 0)
-       return C_OK;
+       return status;
 
     if(WIFEXITED(statloc) && WEXITSTATUS(statloc) != 0) {
         serverLog(LL_WARNING, "rdb writer process exited with status %d",
@@ -2174,6 +2172,72 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
     return C_ERR; /* Just to avoid warning */
 }
 
+int rdbLoadStream(FILE *fp, rdbSaveInfo *rsi) {
+    rio rdb;
+    int retval;
+
+    startLoading(fp);
+    rioInitWithFile(&rdb,fp);
+    retval = rdbLoadRio(&rdb,rsi,0);
+    fclose(fp);
+    stopLoading();
+    return retval;
+}
+
+int rdbLoadFromPipe(char *exec_name, rdbSaveInfo *rsi) {
+    int fds[2];
+    int child_pid;
+    int retval;
+    int statloc;
+    FILE *fp;
+
+    if(pipe(fds)) {
+        serverLog(LL_WARNING,
+            "Failed to create pipe for rdb loader process: %s",
+            strerror(errno));
+    }
+
+    child_pid = fork();
+    if (child_pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+
+        execl(exec_name, exec_name, "load");
+
+        serverLog(LL_WARNING,
+            "Failed to exec rdb loader process (%s): %s",
+            exec_name,
+            strerror(errno));
+        exitFromChild(1);
+    } else if (child_pid == -1) {
+        serverLog(LL_WARNING, "Failed to fork rdb loader process: %s",
+            strerror(errno));
+        return C_ERR;
+    }
+
+    fp = fdopen(fds[0], "r");
+    retval = rdbLoadStream(fp, rsi);
+    if (retval == C_ERR) {
+        serverLog(LL_WARNING, "Error loading DB from pipe");
+    }
+
+    waitpidUntilFinished(child_pid, &statloc);
+    if(WIFEXITED(statloc) && WEXITSTATUS(statloc) == 0)
+        return retval;
+
+    if(WIFEXITED(statloc) && WEXITSTATUS(statloc) != 0) {
+        serverLog(LL_WARNING, "rdb loader process exited with status %d",
+            WEXITSTATUS(statloc));
+    }
+    else if(WIFSIGNALED(statloc)) {
+        serverLog(LL_WARNING, "rdb loader process terminated by signal %d",
+            WTERMSIG(statloc));
+    }
+
+    return C_ERR;
+}
+
 /* Like rdbLoadRio() but takes a filename instead of a rio stream. The
  * filename is open for reading and a rio stream object created in order
  * to do the actual loading. Moreover the ETA displayed in the INFO
@@ -2183,16 +2247,13 @@ eoferr: /* unexpected end of file is handled here with a fatal exit */
  * loading code will fiil the information fields in the structure. */
 int rdbLoad(char *filename, rdbSaveInfo *rsi) {
     FILE *fp;
-    rio rdb;
-    int retval;
+
+    if (filename[0] == '|') {
+        return rdbLoadFromPipe(filename + 1, rsi);
+    }
 
     if ((fp = fopen(filename,"r")) == NULL) return C_ERR;
-    startLoading(fp);
-    rioInitWithFile(&rdb,fp);
-    retval = rdbLoadRio(&rdb,rsi,0);
-    fclose(fp);
-    stopLoading();
-    return retval;
+    return rdbLoadStream(fp, rsi);
 }
 
 /* A background saving child (BGSAVE) terminated its work. Handle this.
